@@ -8,10 +8,11 @@ import chalk from 'chalk';
 import inquirer from 'inquirer';
 import ora from 'ora';
 import figlet from 'figlet';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, sendAndConfirmTransaction, ComputeBudgetProgram } from '@solana/web3.js';
 import * as splToken from '@solana/spl-token';
 import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
 import { Metaplex, keypairIdentity, bundlrStorage, toMetaplexFile } from '@metaplex-foundation/js';
+import * as sns from '@bonfida/spl-name-service';
 
 import { createSignerFromKeypair, publicKey as umiPublicKey, signerIdentity, generateSigner } from '@metaplex-foundation/umi';
 import { fromWeb3JsKeypair } from '@metaplex-foundation/umi-web3js-adapters';
@@ -399,7 +400,7 @@ function displayTitle() {
 }
 
 /**
- * Boot sequence animation - Futuristic Solana terminal
+ * Boot sequence animation -  Solana terminal
  */
 async function bootSequence() {
   console.clear();
@@ -1510,6 +1511,426 @@ async function createMenu() {
   console.log(chalk.bgGreen.black.bold(' PROJECT FORGE '));
   console.log();
 
+// SNS .sol registration flow (top-level)
+// Helper: register SNS domain with safe create-first flow
+async function registerSnsDomainWithCreateIfMissing(connection, payer, nameOnly, opts = {}) {
+  const DATA_SPACE = opts.dataSpace || 4096;
+  const MINT = opts.mint || new PublicKey('So11111111111111111111111111111111111111112');
+  const createFirst = !!opts.createFirst;
+  const doSend = !!opts.send;
+
+  if (!sns?.devnet?.bindings?.registerDomainNameV2) throw new Error('devnet registrar not available');
+
+  // Ensure WSOL ATA exists
+  const wsolAta = await splToken.getOrCreateAssociatedTokenAccount(connection, payer, MINT, payer.publicKey);
+
+  // Ensure payer has minimal balance (devnet airdrop) to cover rent/fees if needed
+  try {
+    const payerBal = await connection.getBalance(payer.publicKey, 'confirmed');
+    const MIN_BAL = LAMPORTS_PER_SOL; // 1 SOL
+    if ((connection.rpcEndpoint && connection.rpcEndpoint.includes('devnet')) && payerBal < MIN_BAL) {
+      console.log(chalk.gray('Payer low balance detected inside helper — requesting airdrop of 2 SOL...'));
+      try {
+        const sig = await connection.requestAirdrop(payer.publicKey, 2 * LAMPORTS_PER_SOL);
+        await connection.confirmTransaction(sig, 'confirmed');
+      } catch (ae) {
+        console.log(chalk.yellow('Airdrop request failed:'), ae?.message || ae);
+      }
+    }
+  } catch (e) {}
+
+  // Ensure WSOL ATA has at least 1 SOL wrapped (sync if we fund it)
+  try {
+    const currentWsol = Number(wsolAta.amount || 0n);
+    const WSOL_MIN = LAMPORTS_PER_SOL; // 1 SOL
+    if (currentWsol === 0) {
+      // transfer 1 SOL to the ATA and sync native
+      try {
+        const { SystemProgram } = await import('@solana/web3.js');
+        const fundTx = new Transaction().add(
+          SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: wsolAta.address, lamports: WSOL_MIN })
+        );
+        fundTx.feePayer = payer.publicKey;
+        const { blockhash: bh } = await connection.getLatestBlockhash('confirmed');
+        fundTx.recentBlockhash = bh;
+        await sendAndConfirmTransaction(connection, fundTx, [payer], { commitment: 'confirmed' });
+        const syncIx = splToken.createSyncNativeInstruction(wsolAta.address);
+        const syncTx = new Transaction().add(syncIx);
+        syncTx.feePayer = payer.publicKey;
+        const { blockhash: bh2 } = await connection.getLatestBlockhash('confirmed');
+        syncTx.recentBlockhash = bh2;
+        await sendAndConfirmTransaction(connection, syncTx, [payer], { commitment: 'confirmed' });
+      } catch (fe) {
+        console.log(chalk.yellow('Failed to fund/sync WSOL ATA:'), fe?.message || fe);
+      }
+    }
+  } catch (e) {}
+
+  // Optionally create name registry (minimal form) if requested
+  let createIxs = [];
+  if (createFirst && typeof sns.devnet.bindings.createNameRegistry === 'function') {
+    try {
+      const maybe = await sns.devnet.bindings.createNameRegistry(
+        connection,
+        nameOnly,
+        DATA_SPACE,
+        payer.publicKey,
+        payer.publicKey
+      );
+      if (maybe) {
+        const arr = Array.isArray(maybe) ? maybe : [maybe];
+        // Safety: ensure no create instruction requires a non-payer signer
+        for (const ix of arr) {
+          for (const k of ix.keys || []) {
+            if (k.isSigner && k.pubkey.toBase58() !== payer.publicKey.toBase58()) {
+              throw new Error(`createNameRegistry requires extra signer ${k.pubkey.toBase58()}`);
+            }
+          }
+        }
+        createIxs.push(...arr);
+      }
+      await new Promise(r => setTimeout(r, 200));
+    } catch (err) {
+      console.log(chalk.yellow('Warning: createNameRegistry skipped or failed:'), err?.message || String(err));
+    }
+  }
+
+  // Build register instructions
+  const res = await sns.devnet.bindings.registerDomainNameV2(
+    connection,
+    nameOnly,
+    DATA_SPACE,
+    payer.publicKey,
+    wsolAta.address,
+    MINT
+  );
+  const regIxs = Array.isArray(res) ? res : [res];
+
+  // Combine create + register into transactions. We'll send create first (if any), then register.
+  if (createIxs.length) {
+    const createTx = new Transaction();
+    createTx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 375_000 }));
+    createTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
+    for (const ix of createIxs) createTx.add(ix);
+    createTx.feePayer = payer.publicKey;
+    const { blockhash: bh } = await connection.getLatestBlockhash();
+    createTx.recentBlockhash = bh;
+
+    // Ensure no unexpected signer flags
+    const signerSet = new Set([payer.publicKey.toBase58()]);
+    for (const ix of createTx.instructions) {
+      for (const meta of ix.keys) {
+        try {
+          const b58 = meta.pubkey.toBase58();
+          if (meta.isSigner && !signerSet.has(b58)) {
+            meta.isSigner = false;
+            console.log(chalk.yellow(`Warning: cleared unexpected signer flag for ${b58}`));
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (doSend) await sendAndConfirmTransaction(connection, createTx, [payer], { commitment: 'confirmed' });
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  // Now registration tx (may be multiple ix)
+  const tx = new Transaction();
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 375_000 }));
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
+  for (const ix of regIxs) tx.add(ix);
+  tx.feePayer = payer.publicKey;
+  const { blockhash } = await connection.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+
+  // Pre-send sanitizer: ensure no instruction requires a signer other than payer
+  for (const ix of tx.instructions) {
+    for (const meta of ix.keys) {
+      if (meta.isSigner && meta.pubkey.toBase58() !== payer.publicKey.toBase58()) {
+        throw new Error(`Refusing to send: instruction requires unknown signer ${meta.pubkey.toBase58()}`);
+      }
+    }
+  }
+
+  // Simulate first
+  const sim = await connection.simulateTransaction(tx, [payer]);
+  if (sim?.value?.err) {
+    const logs = (sim.value && sim.value.logs) ? sim.value.logs : undefined;
+    const msg = sim.value.err ? JSON.stringify(sim.value.err) : 'simulation failed';
+    const err = new Error(`Simulation failed: ${msg}`);
+    err.logs = logs;
+    throw err;
+  }
+
+  if (doSend) {
+    const sig = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
+    return sig;
+  }
+  return null;
+}
+
+async function snsTldFlow() {
+  displayTitle();
+  console.log(chalk.bgHex('#4ADE80').black.bold(' SOLANA NAME SERVICE — REGISTER .SOL DOMAIN '));
+  console.log();
+
+  const config = await loadConfig();
+  const connection = new Connection(config.rpcUrl || 'https://api.devnet.solana.com', 'confirmed');
+
+  // Choose wallet
+  const walletFiles = (await fs.pathExists(WALLETS_DIR)) ? await fs.readdir(WALLETS_DIR) : [];
+  const wallets = walletFiles.filter(f => f.endsWith('.json'));
+  if (wallets.length === 0) {
+    console.log(chalk.red('\nNo wallets found. Create/import one via WALLET menu.'));
+    await new Promise(r => setTimeout(r, 1800));
+    return;
+  }
+  let defaultChoice = config.defaultWallet ? `${config.defaultWallet}.json` : null;
+  if (defaultChoice && !wallets.includes(defaultChoice)) defaultChoice = null;
+  const { walletFile } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'walletFile',
+      message: chalk.green.bold('Select payer wallet'),
+      choices: [
+        ...(defaultChoice ? [{ name: `${config.defaultWallet} (default)`, value: defaultChoice }, new inquirer.Separator()] : []),
+        ...wallets.map(w => ({ name: w.replace('.json',''), value: w }))
+      ],
+      default: defaultChoice || undefined
+    }
+  ]);
+  const payer = Keypair.fromSecretKey(new Uint8Array(await fs.readJSON(path.join(WALLETS_DIR, walletFile))));
+
+  // Ensure some SOL
+  try {
+    const bal = await connection.getBalance(payer.publicKey);
+    if (bal < 0.1 * LAMPORTS_PER_SOL && (config.network === 'devnet' || config.network === 'testnet')) {
+      console.log(chalk.gray('\nLow balance detected, requesting airdrop (1 SOL)...'));
+      await requestAirdrop(payer.publicKey, 1);
+    }
+  } catch {}
+
+  // Ask name
+  const { nameInput } = await inquirer.prompt([
+    { type: 'input', name: 'nameInput', message: chalk.green.bold('Enter desired .sol name (without .sol, e.g. example)'), validate: (v) => {
+      const t = String(v||'').trim().toLowerCase().replace(/^\./,'');
+      if (!t) return 'Name cannot be empty';
+      if (!/^[a-z0-9-]{1,63}$/.test(t)) return 'Use a-z, 0-9, dash; max 63 chars';
+      return true;
+    }}
+  ]);
+  const nameOnly = String(nameInput).trim().toLowerCase().replace(/^\./,'');
+
+  // Check availability
+  const availSpinner = ora('🔹 Checking availability...').start();
+  let domainKey;
+  try {
+    const { pubkey } = sns.getDomainKeySync(`${nameOnly}.sol`);
+    domainKey = pubkey;
+    const info = await connection.getAccountInfo(domainKey);
+    if (info) {
+      availSpinner.fail(`Domain ${nameOnly}.sol is already registered`);
+      return;
+    }
+    availSpinner.succeed(`${nameOnly}.sol is available`);
+  } catch (e) {
+    availSpinner.fail('Failed to check availability');
+    console.log(chalk.red(e.message));
+    return;
+  }
+
+  // Confirm
+  const { confirm } = await inquirer.prompt([
+    { type: 'confirm', name: 'confirm', message: chalk.yellow.bold(`Register ${nameOnly}.sol now on ${config.network}?`), default: true }
+  ]);
+  if (!confirm) { console.log(chalk.gray('Cancelled.')); return; }
+
+  // Register
+  const regSpinner = ora('🔹 Registering domain...').start();
+  try {
+    const clusterParam = config.network === 'mainnet-beta' ? '' : `?cluster=${config.network}`;
+
+    // Ensure payer has enough SOL
+    try {
+      const bal = await connection.getBalance(payer.publicKey);
+      if (bal < 0.5 * LAMPORTS_PER_SOL && (config.network === 'devnet' || config.network === 'testnet')) {
+        regSpinner.stop();
+        console.log(chalk.gray('Low balance. Requesting airdrop...'));
+        await requestAirdrop(payer.publicKey, 5);
+        regSpinner.start('🔹 Registering domain...');
+      }
+    } catch {}
+
+    // NOTE: Previously the code attempted to fall back to an `@bonfida/sns-cli` npx call.
+    // That package is not published on npm (npx would 404). We now rely on the
+    // `@bonfida/spl-name-service` SDK bindings directly and removed the sns-cli fallback.
+    
+    // Use devnet registrar only (correct program IDs and price feeds)
+    // Increase DATA_SPACE to avoid on-chain panics when registrar writes larger metadata.
+    // Previous value (1024) caused 'range end index ... out of range for slice of length 0' in SNS program.
+    // 4096 should be sufficient for typical name metadata; increase further if needed.
+    const DATA_SPACE = 4096; // reserve data so Create v3 can write registrar bytes
+    let regIxs = [];
+    // Default to WSOL mint on devnet; ensure ATA has enough wrapped SOL
+    const MINT = new PublicKey('So11111111111111111111111111111111111111112');
+    if (!sns?.devnet?.bindings?.registerDomainNameV2) throw new Error('devnet registrar not available');
+
+    // Ensure payer WSOL ATA exists and is funded (auto-wrap if needed)
+    const wsolAta = await splToken.getOrCreateAssociatedTokenAccount(connection, payer, MINT, payer.publicKey);
+    const currentWsolLamports = Number(wsolAta.amount || 0n);
+    const targetWrapLamports = Math.max(currentWsolLamports, Math.round(2 * LAMPORTS_PER_SOL)); // wrap at least 2 SOL
+    if (currentWsolLamports < targetWrapLamports) {
+      const delta = targetWrapLamports - currentWsolLamports;
+      const wrapTx = new Transaction().add(
+        SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: wsolAta.address, lamports: delta }),
+        splToken.createSyncNativeInstruction(wsolAta.address)
+      );
+      wrapTx.feePayer = payer.publicKey;
+      const { blockhash: bh1 } = await connection.getLatestBlockhash();
+      wrapTx.recentBlockhash = bh1;
+      await sendAndConfirmTransaction(connection, wrapTx, [payer], { commitment: 'confirmed' });
+    }
+
+    // Register SNS domain inline using reliable logic from debug script
+    let sig;
+    try {
+      regSpinner.text = '🔹 Registering domain...';
+
+      // Load payer keypair
+      const secretKey = await fs.readJSON(path.join(WALLETS_DIR, walletFile));
+      const payer = Keypair.fromSecretKey(new Uint8Array(secretKey));
+
+      // Basic availability check
+      const { pubkey: domainKey } = sns.getDomainKeySync(`${nameOnly}.sol`);
+      const info = await connection.getAccountInfo(domainKey);
+      if (info) {
+        throw new Error(`Domain ${nameOnly}.sol is already registered`);
+      }
+
+      // Prepare DATA_SPACE
+      const DATA_SPACE = 4096;
+      const MINT = new PublicKey('So11111111111111111111111111111111111111112');
+
+      // Ensure payer has minimal balance
+      const payerBal = await connection.getBalance(payer.publicKey, 'confirmed');
+      const MIN_BAL_LAMPORTS = LAMPORTS_PER_SOL;
+      if (connection.rpcEndpoint && connection.rpcEndpoint.includes('devnet') && payerBal < MIN_BAL_LAMPORTS) {
+        await connection.requestAirdrop(payer.publicKey, 2 * LAMPORTS_PER_SOL);
+        await connection.confirmTransaction(await connection.requestAirdrop(payer.publicKey, 2 * LAMPORTS_PER_SOL), 'confirmed');
+      }
+
+      // Ensure WSOL ATA exists
+      const wsolAta = await splToken.getOrCreateAssociatedTokenAccount(connection, payer, MINT, payer.publicKey);
+
+      // Ensure WSOL ATA has at least 1 SOL wrapped
+      const currentWsolLamports = Number(wsolAta.amount || 0n);
+      const WSOL_MIN = LAMPORTS_PER_SOL;
+      if (currentWsolLamports === 0) {
+        const fundTx = new Transaction().add(
+          SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: wsolAta.address, lamports: WSOL_MIN })
+        );
+        fundTx.feePayer = payer.publicKey;
+        const { blockhash: bh } = await connection.getLatestBlockhash('confirmed');
+        fundTx.recentBlockhash = bh;
+        await sendAndConfirmTransaction(connection, fundTx, [payer], { commitment: 'confirmed' });
+        const syncIx = splToken.createSyncNativeInstruction(wsolAta.address);
+        const syncTx = new Transaction().add(syncIx);
+        syncTx.feePayer = payer.publicKey;
+        const { blockhash: bh2 } = await connection.getLatestBlockhash('confirmed');
+        syncTx.recentBlockhash = bh2;
+        await sendAndConfirmTransaction(connection, syncTx, [payer], { commitment: 'confirmed' });
+      }
+
+      // Optionally create name registry first
+      if (typeof sns.devnet.bindings.createNameRegistry === 'function') {
+        try {
+          const createRes = await sns.devnet.bindings.createNameRegistry(
+            connection,
+            nameOnly,
+            DATA_SPACE,
+            payer.publicKey,
+            payer.publicKey
+          );
+          const arr = Array.isArray(createRes) ? createRes : [createRes];
+          for (const ix of arr) {
+            for (const k of ix.keys || []) {
+              if (k.isSigner && k.pubkey.toBase58() !== payer.publicKey.toBase58()) {
+                throw new Error(`createNameRegistry requires extra signer ${k.pubkey.toBase58()}`);
+              }
+            }
+          }
+          const createTx = new Transaction();
+          createTx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 375_000 }));
+          createTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
+          for (const ix of arr) createTx.add(ix);
+          createTx.feePayer = payer.publicKey;
+          const { blockhash: bh } = await connection.getLatestBlockhash();
+          createTx.recentBlockhash = bh;
+          await sendAndConfirmTransaction(connection, createTx, [payer], { commitment: 'confirmed' });
+          await new Promise(r => setTimeout(r, 300));
+        } catch (cfErr) {
+          // Skip if fails
+        }
+      }
+
+      // Get register instructions
+      const res = await sns.devnet.bindings.registerDomainNameV2(
+        connection,
+        nameOnly,
+        DATA_SPACE,
+        payer.publicKey,
+        wsolAta.address,
+        MINT
+      );
+      const regIxs = Array.isArray(res) ? res : [res];
+
+      // Build transaction
+      const tx = new Transaction();
+      tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 375_000 }));
+      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }));
+      for (const ix of regIxs) tx.add(ix);
+      tx.feePayer = payer.publicKey;
+      const { blockhash } = await connection.getLatestBlockhash();
+      tx.recentBlockhash = blockhash;
+
+      // Simulate
+      const sim = await connection.simulateTransaction(tx, [payer]);
+      if (sim?.value?.err) {
+        const msg = sim.value.err ? JSON.stringify(sim.value.err) : 'simulation failed';
+        throw new Error(`Simulation failed: ${msg}`);
+      }
+
+      // Send
+      sig = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
+    } catch (e) {
+      console.error(chalk.red('\nCould not register domain.'));
+      console.error(chalk.red('Original error:'), e?.message || String(e));
+      throw e;
+    }
+
+    regSpinner.succeed('✅ Domain registered!');
+    console.log(chalk.green(`\nDomain: ${nameOnly}.sol`));
+    console.log(chalk.green(`Explorer: https://explorer.solana.com/tx/${sig}${clusterParam}`));
+    console.log(chalk.bold.green(`\n✅ Successfully registered on ${config.network}!\n`));
+
+    await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
+  } catch (e) {
+    regSpinner.fail('Registration failed');
+    console.log(chalk.red(e?.message || String(e)));
+    try {
+      if (e?.name === 'SendTransactionError' && typeof e.getLogs === 'function') {
+        const logs = await e.getLogs();
+        console.log(chalk.gray('Logs:'), logs);
+      } else if (e?.logs) {
+        console.log(chalk.gray('Logs:'), e.logs);
+      }
+    } catch {}
+    console.log(chalk.yellow('\nTip: SNS domains require rent + fees. Ensure you have 1+ SOL'));
+    await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
+  }
+}
+
+
   const { buildTarget } = await inquirer.prompt([
     {
       type: 'list',
@@ -1551,6 +1972,10 @@ async function createMenu() {
         { 
           name: chalk.white('[ 8 ]') + ' ' + chalk.green.bold('FULL-STACK KIT') + chalk.gray('  Paired frontend and backend'), 
           value: 'fullstack' 
+        },
+        { 
+          name: chalk.white('[ 9 ]') + ' ' + chalk.green.bold('SNS TLD') + chalk.gray('         Create your own .tld on SNS'), 
+          value: 'sns-tld' 
         },
         new inquirer.Separator(chalk.hex('#8B5CF6')('─'.repeat(75))),
         { 
@@ -1633,9 +2058,12 @@ async function createNftCollectionOrWebsiteFlow() {
     case 'fullstack':
       await buildFullStack();
       break;
+    case 'sns-tld':
+      await snsTldFlow();
+      break;
   }
-}
 
+}
 
 /**
  * Raffle creation flow inside CREATE menu
@@ -3598,6 +4026,109 @@ async function createWallet() {
         default: true
       }
     ]);
+
+/**
+ * SNS TLD creation flow (guided)
+ */
+async function snsTldFlow_DEAD() {
+  displayTitle();
+  console.log(chalk.bgHex('#4ADE80').black.bold(' SOLANA NAME SERVICE — CREATE CUSTOM TLD '));
+  console.log();
+
+  const config = await loadConfig();
+  const connection = new Connection(config.rpcUrl || 'https://api.devnet.solana.com', 'confirmed');
+
+  // Choose wallet
+  const walletFiles = (await fs.pathExists(WALLETS_DIR)) ? await fs.readdir(WALLETS_DIR) : [];
+  const wallets = walletFiles.filter(f => f.endsWith('.json'));
+  if (wallets.length === 0) {
+    console.log(chalk.red('\nNo wallets found. Create/import one via WALLET menu.'));
+    await new Promise(r => setTimeout(r, 1800));
+    return;
+  }
+  let defaultChoice = config.defaultWallet ? `${config.defaultWallet}.json` : null;
+  if (defaultChoice && !wallets.includes(defaultChoice)) defaultChoice = null;
+  const { walletFile } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'walletFile',
+      message: chalk.green.bold('Select payer wallet'),
+      choices: [
+        ...(defaultChoice ? [{ name: `${config.defaultWallet} (default)`, value: defaultChoice }, new inquirer.Separator()] : []),
+        ...wallets.map(w => ({ name: w.replace('.json',''), value: w }))
+      ],
+      default: defaultChoice || undefined
+    }
+  ]);
+  const payer = Keypair.fromSecretKey(new Uint8Array(await fs.readJSON(path.join(WALLETS_DIR, walletFile))));
+
+  // Ensure some SOL
+  try {
+    const bal = await connection.getBalance(payer.publicKey);
+    if (bal < 0.1 * LAMPORTS_PER_SOL && (config.network === 'devnet' || config.network === 'testnet')) {
+      console.log(chalk.gray('\nLow balance detected, requesting airdrop (1 SOL)...'));
+      await requestAirdrop(payer.publicKey, 1);
+    }
+  } catch {}
+
+  // Ask TLD
+  const { tldInput } = await inquirer.prompt([
+    { type: 'input', name: 'tldInput', message: chalk.green.bold('Enter desired TLD (no dot, e.g. example)'), validate: (v) => {
+      const t = String(v||'').trim().toLowerCase().replace(/^\./,'');
+      if (!t) return 'TLD cannot be empty';
+      if (!/^[a-z0-9-]{1,63}$/.test(t)) return 'Use a-z, 0-9, dash; max 63 chars';
+      return true;
+    }}
+  ]);
+  const tld = String(tldInput).trim().toLowerCase().replace(/^\./,'');
+
+  // Check availability
+  const availSpinner = ora('🔹 Checking availability...').start();
+  let nameKey;
+  try {
+    const hashed = await sns.getHashedName(tld);
+    nameKey = await sns.getNameAccountKey(hashed, undefined, sns.ROOT_DOMAIN_ACCOUNT);
+    const info = await connection.getAccountInfo(nameKey);
+    if (info) {
+      availSpinner.fail(`TLD .${tld} is already registered`);
+      return;
+    }
+    availSpinner.succeed(`.${tld} is available`);
+  } catch (e) {
+    availSpinner.fail('Failed to check availability');
+    console.log(chalk.red(e.message));
+    return;
+  }
+
+  // Confirm
+  const { confirm } = await inquirer.prompt([
+    { type: 'confirm', name: 'confirm', message: chalk.yellow.bold(`Register .${tld} now on ${config.network}?`), default: true }
+  ]);
+  if (!confirm) { console.log(chalk.gray('Cancelled.')); return; }
+
+  // Register
+  const regSpinner = ora('🔹 Sending transaction...').start();
+  try {
+    const registerFn = sns.registerTopLevelDomainV2 || sns.registerTopLevelDomain || sns.registerTopLevelDomainV3;
+    if (typeof registerFn !== 'function') throw new Error('SNS SDK does not expose a TLD registration function');
+    const ix = await registerFn(tld, payer.publicKey, payer.publicKey, payer.publicKey);
+    const tx = new Transaction().add(ix);
+    tx.feePayer = payer.publicKey;
+    const sig = await sendAndConfirmTransaction(connection, tx, [payer], { commitment: 'confirmed' });
+    try { const sim = await connection.simulateTransaction(tx, [payer]); if (sim?.value?.err) { regSpinner.fail('Simulation failed'); const logs = sim.value.logs || []; console.log(chalk.red('Simulation error:'), JSON.stringify(sim.value.err)); if (logs.length) console.log(chalk.gray(logs.join('\n'))); console.log(chalk.yellow('\nSNS TLD registration is permissioned. You must be the TLD registrar/authority to execute this.')); return; } } catch (_) {}
+    regSpinner.succeed('Transaction confirmed');
+
+    console.log(chalk.green(`\nName account: ${nameKey.toBase58()}`));
+    await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
+    const clusterParam = config.network === 'mainnet-beta' ? '' : `?cluster=${config.network}`;
+    console.log(chalk.green(`Transaction: https://explorer.solana.com/tx/${sig}${clusterParam}`));
+    console.log(chalk.bold.green(`\n✅ Your custom domain .${tld} has been successfully created on Solana ${config.network}!\n`));
+  } catch (e) {
+    regSpinner.fail('Registration failed');
+    console.log(chalk.red(e.message));
+  }
+}
+
     
     if (airdrop) {
       await requestAirdrop(keypair.publicKey);
@@ -4997,7 +5528,7 @@ function exitCLI() {
 
   console.log(chalk.red(exitArt));
   console.log();
-  console.log(chalk.gray.dim('                       Lili CLI v0.0.3 - Solana Developer Toolkit'));
+  console.log(chalk.gray.dim('                       Lili CLI v1.0.0 - Solana Developer Toolkit'));
   console.log();
   
   process.exit(0);
