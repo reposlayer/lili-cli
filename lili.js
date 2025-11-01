@@ -164,8 +164,155 @@ function formatSol(amount, decimals = 4) {
 const CONFIG_DIR = path.join(os.homedir(), '.lili-cli');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const WALLETS_DIR = path.join(CONFIG_DIR, 'wallets');
-const TEMPLATES_DIR = path.join(__dirname, 'templates');
+const resolveTemplatesDir = () => {
+  const candidates = [
+    path.join(__dirname, 'templates'),
+    path.join(__dirname, '..', 'templates'),
+    path.join(process.cwd(), 'templates')
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(path.join(candidate, 'manifest.json'))) {
+        return candidate;
+      }
+    } catch {
+      // ignore lookup failures and keep searching
+    }
+  }
+  return path.join(__dirname, 'templates');
+};
+
+const PACKAGE_MANAGER_INSTALL = {
+  npm: 'npm install',
+  pnpm: 'pnpm install',
+  yarn: 'yarn install',
+  bun: 'bun install'
+};
+
+const PACKAGE_MANAGER_DEV = {
+  npm: 'npm run dev',
+  pnpm: 'pnpm dev',
+  yarn: 'yarn dev',
+  bun: 'bun dev'
+};
+
+const resolveBootstrapCwd = (base, subdir) => subdir ? path.join(base, subdir) : base;
+
+async function loadPackageJsonIfExists(dir) {
+  const file = path.join(dir, 'package.json');
+  if (!(await fs.pathExists(file))) return null;
+  return fs.readJSON(file).catch(() => null);
+}
+
+async function detectPackageManager(dir, preferred) {
+  if (preferred) return preferred;
+  const candidates = [
+    { file: 'pnpm-lock.yaml', value: 'pnpm' },
+    { file: 'yarn.lock', value: 'yarn' },
+    { file: 'bun.lockb', value: 'bun' },
+    { file: 'package-lock.json', value: 'npm' }
+  ];
+  for (const candidate of candidates) {
+    if (await fs.pathExists(path.join(dir, candidate.file))) {
+      return candidate.value;
+    }
+  }
+  return (await fs.pathExists(path.join(dir, 'package.json'))) ? 'npm' : null;
+}
+
+function formatStepName(defaultLabel, command) {
+  return defaultLabel || command;
+}
+
+async function bootstrapTemplateDestination(template, destination) {
+  const bootstrap = template.bootstrap || {};
+  const packageJson = await loadPackageJsonIfExists(destination);
+  const packageManager = await detectPackageManager(destination, bootstrap.packageManager);
+  const steps = [];
+
+  let installCommand = bootstrap.installCommand || null;
+  if (!installCommand && packageJson && packageManager) {
+    installCommand = PACKAGE_MANAGER_INSTALL[packageManager] || null;
+  }
+  if (installCommand) {
+    steps.push({
+      name: formatStepName('Install dependencies', installCommand),
+      command: installCommand,
+      cwd: resolveBootstrapCwd(destination, bootstrap.installCwd),
+      env: bootstrap.installEnv || null
+    });
+  }
+
+  const deployCommands = Array.isArray(bootstrap.deployCommands) ? bootstrap.deployCommands : [];
+  for (const entry of deployCommands) {
+    if (!entry) continue;
+    if (typeof entry === 'string') {
+      steps.push({
+        name: formatStepName('Run deployment command', entry),
+        command: entry,
+        cwd: destination,
+        env: null
+      });
+      continue;
+    }
+    steps.push({
+      name: formatStepName(entry.name || null, entry.command),
+      command: entry.command,
+      cwd: resolveBootstrapCwd(destination, entry.cwd),
+      env: entry.env || null
+    });
+  }
+
+  if (steps.length) {
+    console.log(chalk.cyan('\nBootstrapping workspace...'));
+  }
+
+  for (const step of steps) {
+    console.log(chalk.whiteBright(`\n→ ${step.name}`));
+    try {
+      await runShellCommand(step.command, {
+        cwd: step.cwd,
+        env: step.env || undefined,
+        stdio: 'inherit'
+      });
+    } catch (error) {
+      throw new Error(`Step "${step.name}" failed: ${error.message}`);
+    }
+  }
+
+  if (steps.length) {
+    console.log(chalk.green('\nBootstrap steps completed.'));
+  }
+
+  let devCommand = bootstrap.devCommand || null;
+  if (!devCommand && packageJson && packageManager && packageJson.scripts && packageJson.scripts.dev) {
+    devCommand = PACKAGE_MANAGER_DEV[packageManager] || null;
+  }
+
+  return {
+    devCommand,
+    devCwd: resolveBootstrapCwd(destination, bootstrap.devCwd),
+    devEnv: bootstrap.devEnv || null
+  };
+}
+
+async function launchDevServer(command, options = {}) {
+  if (!command) return;
+  console.log(chalk.cyan(`\nStarting development server with "${command}"`));
+  console.log(chalk.gray('Press Ctrl+C to stop the server when you are finished.'));
+  await runShellCommand(command, {
+    cwd: options.cwd,
+    env: options.env || undefined,
+    stdio: 'inherit'
+  });
+}
+
+const TEMPLATES_DIR = resolveTemplatesDir();
 const COLLECTIONS_FILE = path.join(CONFIG_DIR, 'collections.json');
+const TEMPLATE_CACHE_DIR = path.join(CONFIG_DIR, 'templates');
+const TEMPLATE_MANIFEST_FILE = path.join(TEMPLATES_DIR, 'manifest.json');
+const USER_TEMPLATE_MANIFEST = path.join(CONFIG_DIR, 'templates-manifest.json');
+const DOCTOR_HISTORY_FILE = path.join(CONFIG_DIR, 'doctor-history.json');
 
 // Default configuration
 const DEFAULT_CONFIG = {
@@ -188,7 +335,21 @@ async function initConfig() {
     await fs.ensureDir(CONFIG_DIR);
     await fs.ensureDir(WALLETS_DIR);
     await fs.ensureDir(TEMPLATES_DIR);
-    if (!(await fs.pathExists(COLLECTIONS_FILE))) { await fs.writeJSON(COLLECTIONS_FILE, { collections: [] }, { spaces: 2 }); }
+    await fs.ensureDir(TEMPLATE_CACHE_DIR);
+    if (!(await fs.pathExists(COLLECTIONS_FILE))) {
+      await fs.writeJSON(COLLECTIONS_FILE, { collections: [] }, { spaces: 2 });
+    }
+    if (!(await fs.pathExists(USER_TEMPLATE_MANIFEST))) {
+      if (await fs.pathExists(TEMPLATE_MANIFEST_FILE)) {
+        await fs.copy(TEMPLATE_MANIFEST_FILE, USER_TEMPLATE_MANIFEST);
+      } else {
+        await fs.writeJSON(USER_TEMPLATE_MANIFEST, { version: 1, templates: [] }, { spaces: 2 });
+      }
+    }
+    await reconcileTemplateManifestWithDefaults();
+    if (!(await fs.pathExists(DOCTOR_HISTORY_FILE))) {
+      await fs.writeJSON(DOCTOR_HISTORY_FILE, [], { spaces: 2 });
+    }
     
 
 /**
@@ -374,6 +535,216 @@ async function saveConfig(config) {
   }
 }
 
+async function loadTemplateManifest() {
+  try {
+    const manifest = await fs.readJSON(USER_TEMPLATE_MANIFEST);
+    if (!Array.isArray(manifest.templates)) {
+      manifest.templates = [];
+    }
+    manifest.version = manifest.version ?? 1;
+    return manifest;
+  } catch {
+    return { version: 1, templates: [] };
+  }
+}
+
+async function saveTemplateManifest(manifest) {
+  const payload = {
+    version: manifest?.version ?? 1,
+    templates: Array.isArray(manifest?.templates) ? manifest.templates : []
+  };
+  await fs.writeJSON(USER_TEMPLATE_MANIFEST, payload, { spaces: 2 });
+}
+
+async function reconcileTemplateManifestWithDefaults() {
+  try {
+    if (!(await fs.pathExists(USER_TEMPLATE_MANIFEST))) return;
+    if (!(await fs.pathExists(TEMPLATE_MANIFEST_FILE))) return;
+
+    const base = await fs.readJSON(TEMPLATE_MANIFEST_FILE).catch(() => null);
+    if (!base || !Array.isArray(base.templates)) return;
+
+    const user = await loadTemplateManifest();
+    const merged = Array.isArray(user.templates) ? [...user.templates] : [];
+    const index = new Map(merged.map((tpl, idx) => [tpl.name, idx]));
+    let changed = false;
+
+    for (const tpl of base.templates) {
+      if (!tpl || !tpl.name) continue;
+      if (index.has(tpl.name)) {
+        const existing = merged[index.get(tpl.name)];
+        const keys = ['title', 'description', 'source', 'repo', 'ref', 'subdir', 'localPath', 'featured', 'bootstrap'];
+        for (const key of keys) {
+          if (tpl[key] === undefined) continue;
+          const same = key === 'bootstrap'
+            ? JSON.stringify(existing[key] ?? null) === JSON.stringify(tpl[key] ?? null)
+            : existing[key] === tpl[key];
+          if (same) continue;
+          existing[key] = tpl[key];
+          changed = true;
+        }
+      } else {
+        merged.push(tpl);
+        index.set(tpl.name, merged.length - 1);
+        changed = true;
+      }
+    }
+
+    const targetVersion = Math.max(base.version ?? 1, user.version ?? 1);
+    if ((user.version ?? 1) !== targetVersion) {
+      changed = true;
+    }
+
+    if (!changed) return;
+
+    merged.sort((a, b) => (a.title || a.name).localeCompare(b.title || b.name));
+    await saveTemplateManifest({ version: targetVersion, templates: merged });
+  } catch {
+    // Ignore reconciliation failures; user manifest remains untouched
+  }
+}
+
+async function listCachedTemplates() {
+  if (!(await fs.pathExists(TEMPLATE_CACHE_DIR))) return [];
+  const entries = await fs.readdir(TEMPLATE_CACHE_DIR);
+  const result = [];
+  for (const name of entries) {
+    const absolute = path.join(TEMPLATE_CACHE_DIR, name);
+    const stat = await fs.stat(absolute).catch(() => null);
+    if (!stat || !stat.isDirectory()) continue;
+    const metaFile = path.join(absolute, '.lili-template.json');
+    let meta = {};
+    if (await fs.pathExists(metaFile)) {
+      meta = await fs.readJSON(metaFile).catch(() => ({}));
+    }
+    result.push({ name, path: absolute, meta });
+  }
+  return result;
+}
+
+async function writeTemplateMetadata(targetDir, template) {
+  const meta = {
+    name: template.name,
+    title: template.title || template.displayName || template.name,
+    source: template.source || 'github',
+    repo: template.repo || null,
+    ref: template.ref || null,
+    subdir: template.subdir || null,
+    localPath: template.localPath || template.path || null,
+    cachePath: template.cachePath || null,
+    description: template.description || null,
+    bootstrap: template.bootstrap || null,
+    updatedAt: new Date().toISOString()
+  };
+  await fs.writeJSON(path.join(targetDir, '.lili-template.json'), meta, { spaces: 2 });
+}
+
+async function copyLocalTemplate(template, destination) {
+  const localPath = template.localPath || template.path || template.name;
+  const sourceDir = path.join(TEMPLATES_DIR, localPath);
+  if (!(await fs.pathExists(sourceDir))) {
+    throw new Error(`Local template not found at ${localPath}`);
+  }
+  await fs.copy(sourceDir, destination, { overwrite: true, recursive: true });
+  await writeTemplateMetadata(destination, { ...template, source: 'local' });
+}
+
+async function cloneTemplateFromGitHub(template, destination) {
+  if (!template.repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(template.repo)) {
+    throw new Error('Invalid GitHub repository identifier');
+  }
+  const branch = template.ref || 'main';
+  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'lili-template-'));
+  const gitUrl = `https://github.com/${template.repo}.git`;
+  const cloneCmd = `git clone --depth=1 --branch ${branch} ${gitUrl} "${tmpRoot}"`;
+  try {
+    await execAsync(cloneCmd);
+    const sourceDir = template.subdir ? path.join(tmpRoot, template.subdir) : tmpRoot;
+    if (!(await fs.pathExists(sourceDir))) {
+      throw new Error('Subdirectory not found in cloned repository');
+    }
+    await fs.copy(sourceDir, destination, { overwrite: true, recursive: true });
+  } catch (error) {
+    throw new Error(`Failed to download template from GitHub: ${error.message}`);
+  } finally {
+    await fs.remove(tmpRoot).catch(() => null);
+  }
+  await writeTemplateMetadata(destination, template);
+}
+
+async function ensureTemplateCache(template, options = {}) {
+  const targetDir = path.join(TEMPLATE_CACHE_DIR, template.name);
+  const force = options.force ?? false;
+  if (!force && (await fs.pathExists(targetDir))) {
+    return targetDir;
+  }
+  await fs.remove(targetDir).catch(() => null);
+  await fs.ensureDir(path.dirname(targetDir));
+  if ((template.source || '').toLowerCase() === 'local') {
+    await copyLocalTemplate(template, targetDir);
+  } else {
+    await cloneTemplateFromGitHub(template, targetDir);
+  }
+  return targetDir;
+}
+
+async function refreshAllTemplates(options = {}) {
+  const manifest = await loadTemplateManifest();
+  const results = [];
+  for (const template of manifest.templates) {
+    try {
+      const pathResult = await ensureTemplateCache(template, options);
+      results.push({ name: template.name, status: 'ok', path: pathResult });
+    } catch (error) {
+      results.push({ name: template.name, status: 'error', error: error.message });
+    }
+  }
+  return results;
+}
+
+async function loadDoctorHistory() {
+  try {
+    const history = await fs.readJSON(DOCTOR_HISTORY_FILE);
+    return Array.isArray(history) ? history : [];
+  } catch {
+    return [];
+  }
+}
+
+async function recordDoctorEvent(event) {
+  try {
+    const history = await loadDoctorHistory();
+    history.unshift({ ...event, timestamp: new Date().toISOString() });
+    const trimmed = history.slice(0, 25);
+    await fs.writeJSON(DOCTOR_HISTORY_FILE, trimmed, { spaces: 2 });
+  } catch {
+    // Swallow persistence errors to avoid blocking doctor flow
+  }
+}
+
+async function runShellCommand(command, options = {}) {
+  const isWindows = process.platform === 'win32';
+  const shell = options.shell || (isWindows ? 'powershell.exe' : 'zsh');
+  const shellArgs = isWindows
+    ? ['-NoLogo', '-NoProfile', '-Command', command]
+    : ['-lc', command];
+  return new Promise((resolve, reject) => {
+    const child = spawn(shell, shellArgs, {
+      stdio: options.stdio || 'inherit',
+      env: { ...process.env, ...options.env },
+      cwd: options.cwd || process.cwd()
+    });
+    child.on('error', reject);
+    child.on('exit', code => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Command failed (${command}) with exit code ${code}`));
+      }
+    });
+  });
+}
+
 
 /**
  * Display futuristic ASCII title with animation
@@ -409,7 +780,7 @@ async function bootSequence() {
   const bootHeader = centeredBox([
     '',
     'LILI CLI SYSTEM',
-    '[ VERSION 1.0.0 ]',
+    '[ VERSION 0.0.4 ]',
     ''
   ]);
 
@@ -651,6 +1022,14 @@ async function mainMenu() {
             name: chalk.white('[ 6 ]') + ' ' + chalk.yellow.bold('SETTINGS   ') + chalk.gray(' Configure network and wallet options'),
             value: 'settings'
           },
+          {
+            name: chalk.white('[ 7 ]') + ' ' + chalk.yellow.bold('TEMPLATES  ') + chalk.gray(' Sync local cache with GitHub templates'),
+            value: 'templates'
+          },
+          {
+            name: chalk.white('[ 8 ]') + ' ' + chalk.yellow.bold('DOCTOR     ') + chalk.gray(' Diagnose and auto-fix environment issues'),
+            value: 'doctor'
+          },
           new inquirer.Separator(chalk.yellow('─'.repeat(75))),
           {
             name: chalk.white('[ 0 ]') + ' ' + chalk.red.bold('EXIT       ') + chalk.gray(' Terminate session and exit CLI'),
@@ -679,6 +1058,12 @@ async function mainMenu() {
         break;
       case 'settings':
         await settingsMenu();
+        break;
+      case 'templates':
+        await templatesMenu();
+        break;
+      case 'doctor':
+        await runDoctor();
         break;
       case 'exit':
         exitCLI();
@@ -718,12 +1103,13 @@ async function showHelp() {
       description: 'Generate ready-to-use Solana project scaffolds',
       usage: 'Provision contracts, frontends, backends, or full-stack kits',
       options: [
+        'NFT Collection       - Create collection metadata and optional mint site',
         'SPL Token            - Create fungible token and mint supply',
-        'Token-Gated Website  - Next.js gated site with SPL access',
         'Solana Program       - Rust-based on-chain starter',
         'Frontend dApp        - React app with wallet adapter',
         'Backend API          - Express service wired for Solana',
-        'Full-Stack Kit       - Coordinated frontend and backend'
+        'Full-Stack Kit       - Coordinated frontend and backend',
+        'Featured Templates   - Jump into GitHub-powered scaffolds'
       ]
     },
     {
@@ -756,6 +1142,26 @@ async function showHelp() {
         'Network Selection    - Switch between devnet/testnet/mainnet',
         'Custom RPC           - Configure custom RPC endpoints',
         'Reset Defaults       - Restore factory configuration'
+      ]
+    },
+    {
+      name: 'TEMPLATES',
+      description: 'Manage cached project templates and pull from GitHub',
+      usage: 'Sync local template catalog, pull repositories, inspect cache',
+      options: [
+        'Sync Catalog         - Refresh manifest templates into the local cache',
+        'Pull From GitHub     - Clone external repositories into templates',
+        'List Cached          - Display cached templates with metadata'
+      ]
+    },
+    {
+      name: 'DOCTOR',
+      description: 'Diagnose and auto-fix environment prerequisites',
+      usage: 'Verifies Solana tooling and applies automated fixes where needed',
+      options: [
+        'Auto Fix             - Repair missing Solana CLI or Rust toolchain',
+        'Diagnostics Log      - Review the last remediation attempts',
+        'Version Check        - Validate Node, Solana, Rust, and cargo-build-sbf'
       ]
     }
   ];
@@ -798,33 +1204,33 @@ async function buildMenu() {
   
   const { buildType } = await inquirer.prompt([
     {
-      type: 'list',
-      name: 'buildType',
-      message: chalk.yellow.bold('Select build target'),
-      choices: [
-        { 
-          name: chalk.white('[ 1 ]') + ' ' + chalk.yellow.bold('SOLANA CONTRACT') + chalk.gray('   Rust-based on-chain program'), 
-          value: 'contract' 
-        },
-        { 
-          name: chalk.white('[ 2 ]') + ' ' + chalk.yellow.bold('FRONTEND DAPP') + chalk.gray('     React application with wallet adapter'), 
-          value: 'frontend' 
-        },
-        { 
-          name: chalk.white('[ 3 ]') + ' ' + chalk.yellow.bold('BACKEND API') + chalk.gray('       Node.js server with Solana integration'), 
-          value: 'backend' 
-        },
-        { 
-          name: chalk.white('[ 4 ]') + ' ' + chalk.yellow.bold('FULL-STACK') + chalk.gray('        Complete frontend and backend setup'), 
-          value: 'fullstack' 
-        },
-        new inquirer.Separator(chalk.yellow('─'.repeat(75))),
-        { 
-          name: chalk.white('[ 0 ]') + ' ' + chalk.gray.bold('BACK') + chalk.gray('            Return to main menu'), 
-          value: 'back' 
-        }
-      ],
-      pageSize: 10
+          type: 'list',
+          name: 'buildType',
+          message: chalk.yellow.bold('Select build target'),
+          choices: [
+            { 
+              name: chalk.white('[ 1 ]') + ' ' + chalk.yellow.bold('SOLANA CONTRACT') + chalk.gray('   Rust-based on-chain program'), 
+              value: 'contract' 
+            },
+            { 
+              name: chalk.white('[ 2 ]') + ' ' + chalk.yellow.bold('FRONTEND DAPP') + chalk.gray('     React application with wallet adapter'), 
+              value: 'frontend' 
+            },
+            { 
+              name: chalk.white('[ 3 ]') + ' ' + chalk.yellow.bold('BACKEND API') + chalk.gray('       Node.js server with Solana integration'), 
+              value: 'backend' 
+            },
+            { 
+              name: chalk.white('[ 4 ]') + ' ' + chalk.yellow.bold('FULL-STACK') + chalk.gray('        Complete frontend and backend setup'), 
+              value: 'fullstack' 
+            },
+            new inquirer.Separator(chalk.yellow('─'.repeat(75))),
+            { 
+              name: chalk.white('[ 0 ]') + ' ' + chalk.gray.bold('BACK') + chalk.gray('            Return to main menu'), 
+              value: 'back' 
+            }
+          ],
+          pageSize: 10
     }
   ]);
   
@@ -1946,36 +2352,29 @@ async function snsTldFlow() {
           value: 'spl-token' 
         },
         { 
-          name: chalk.white('[ 2 ]') + ' ' + chalk.green.bold('TOKEN-GATED WEBSITE') + chalk.gray('  Next.js gated site scaffold'), 
-          value: 'token-gated' 
-        },
-        { 
-          name: chalk.white('[ 3 ]') + ' ' + chalk.green.bold('RAFFLE DAPP') + chalk.gray('       Program+React with auto Program ID'), 
-          value: 'raffle' 
-        },
-        { 
-          name: chalk.white('[ 4 ]') + ' ' + chalk.green.bold('CREATE DAO') + chalk.gray('       Gov token + multisig'), 
-          value: 'dao' 
-        },
-        { 
-          name: chalk.white('[ 5 ]') + ' ' + chalk.green.bold('SOLANA PROGRAM') + chalk.gray('   Rust on-chain template'), 
+          name: chalk.white('[ 2 ]') + ' ' + chalk.green.bold('SOLANA PROGRAM') + chalk.gray('   Rust on-chain template'), 
           value: 'contract' 
         },
         { 
-          name: chalk.white('[ 6 ]') + ' ' + chalk.green.bold('FRONTEND DAPP') + chalk.gray('    React wallet-ready app'), 
+          name: chalk.white('[ 3 ]') + ' ' + chalk.green.bold('FRONTEND DAPP') + chalk.gray('    React wallet-ready app'), 
           value: 'frontend' 
         },
         { 
-          name: chalk.white('[ 7 ]') + ' ' + chalk.green.bold('BACKEND API') + chalk.gray('      Express service with web3'), 
+          name: chalk.white('[ 4 ]') + ' ' + chalk.green.bold('BACKEND API') + chalk.gray('      Express service with web3'), 
           value: 'backend' 
         },
         { 
-          name: chalk.white('[ 8 ]') + ' ' + chalk.green.bold('FULL-STACK KIT') + chalk.gray('  Paired frontend and backend'), 
+          name: chalk.white('[ 5 ]') + ' ' + chalk.green.bold('FULL-STACK KIT') + chalk.gray('  Paired frontend and backend'), 
           value: 'fullstack' 
         },
         { 
-          name: chalk.white('[ 9 ]') + ' ' + chalk.green.bold('SNS TLD') + chalk.gray('         Create your own .tld on SNS'), 
+          name: chalk.white('[ 6 ]') + ' ' + chalk.green.bold('SNS TLD') + chalk.gray('         Create your own .tld on SNS'), 
           value: 'sns-tld' 
+        },
+        new inquirer.Separator(chalk.hex('#4ADE80')('─'.repeat(75))),
+        {
+          name: chalk.white('[ 7 ]') + ' ' + chalk.green.bold('FEATURED TEMPLATES') + chalk.gray('  Pull curated GitHub starters'),
+          value: 'open-templates'
         },
         new inquirer.Separator(chalk.hex('#8B5CF6')('─'.repeat(75))),
         { 
@@ -1990,8 +2389,8 @@ async function snsTldFlow() {
   if (buildTarget === 'back') return;
 
 
-  if (buildTarget === 'raffle') {
-    await createRaffleFlow();
+  if (buildTarget === 'open-templates') {
+    await templatesMenu();
     return;
   }
 
@@ -2036,15 +2435,6 @@ async function createNftCollectionOrWebsiteFlow() {
       break;
     case 'spl-token':
       await createSplTokenFlow();
-      break;
-    case 'token-gated':
-      await createTokenGatedWebsiteFlow();
-      break;
-    case 'raffle':
-      await createRaffleFlow();
-      break;
-    case 'dao':
-      await createDaoFlow();
       break;
     case 'contract':
       await buildContract();
@@ -5502,6 +5892,630 @@ async function requestAirdropViaRpc(connection, publicKey, lamports, amount, spi
     }
   }
   return signature;
+}
+
+async function templatesMenu() {
+  await initConfig();
+
+  while (true) {
+    displayTitle();
+    const manifest = await loadTemplateManifest();
+    const cached = await listCachedTemplates();
+
+    console.log(chalk.bgHex('#8B5CF6').black.bold(' TEMPLATE MANAGEMENT '));
+    console.log();
+    console.log(chalk.gray(`Catalog entries : ${manifest.templates.length}`));
+    console.log(chalk.gray(`Cached templates: ${cached.length}`));
+    console.log();
+
+    const { action } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'action',
+        message: chalk.yellow.bold('Select template action'),
+        choices: [
+          {
+            name: chalk.white('[ 0 ]') + ' ' + chalk.yellow.bold('FEATURED PICKS') + chalk.gray('  One-click pull of official templates'),
+            value: 'featured'
+          },
+          {
+            name: chalk.white('[ 1 ]') + ' ' + chalk.yellow.bold('SYNC CATALOG ') + chalk.gray('  Refresh manifest-defined templates'),
+            value: 'sync'
+          },
+          {
+            name: chalk.white('[ 2 ]') + ' ' + chalk.yellow.bold('PULL TEMPLATE') + chalk.gray('  Clone GitHub repository into cache'),
+            value: 'pull'
+          },
+          {
+            name: chalk.white('[ 3 ]') + ' ' + chalk.yellow.bold('LIST CACHE  ') + chalk.gray('  View cached templates with metadata'),
+            value: 'list'
+          },
+          {
+            name: chalk.white('[ 4 ]') + ' ' + chalk.yellow.bold('VIEW MANIFEST') + chalk.gray(' Inspect manifest entries'),
+            value: 'manifest'
+          },
+          new inquirer.Separator(chalk.hex('#8B5CF6')('─'.repeat(75))),
+          {
+            name: chalk.white('[ 0 ]') + ' ' + chalk.gray.bold('BACK') + chalk.gray('            Return to main menu'),
+            value: 'back'
+          }
+        ],
+        pageSize: 10
+      }
+    ]);
+
+    switch (action) {
+      case 'sync': {
+        if (manifest.templates.length === 0) {
+          console.log(chalk.yellow('\nNo templates found in manifest. Use "Pull Template" to add one first.\n'));
+          await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to continue') }]);
+          break;
+        }
+        try {
+          const results = await runWithLoadingBar(
+            { text: 'Syncing template catalog', prefix: 'TPL', color: 'magenta', durationMs: 4000 },
+            () => refreshAllTemplates({ force: true })
+          );
+          console.log();
+          console.log(chalk.bgHex('#8B5CF6').black.bold(' SYNC SUMMARY '));
+          console.log();
+          if (!results.length) {
+            console.log(chalk.yellow('Manifest is empty – nothing to sync.'));
+          } else {
+            results.forEach((item, idx) => {
+              const statusLabel = item.status === 'ok' ? 'CACHED' : item.status === 'error' ? 'ERROR' : 'UPDATED';
+              const statusColor = item.status === 'ok' ? chalk.green : item.status === 'error' ? chalk.red : chalk.yellow;
+              const errorMsg = item.error ? chalk.gray(` ${item.error}`) : '';
+              console.log(
+                chalk.white(`${String(idx + 1).padStart(2, '0')}. `) +
+                chalk.white(item.name.padEnd(18)) +
+                ' ' + statusColor(statusLabel.padEnd(8)) +
+                chalk.gray(' -> ') +
+                chalk.gray(item.path || '') +
+                errorMsg
+              );
+            });
+          }
+        } catch (error) {
+          console.log();
+          console.log(chalk.red('Template sync failed:'), chalk.gray(error.message));
+        }
+        console.log();
+        await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to continue') }]);
+        break;
+      }
+      case 'featured':
+        await featuredTemplatePull(manifest);
+        break;
+      case 'pull':
+        await templatePullFlow(manifest);
+        break;
+      case 'list':
+        await showCachedTemplatesView(cached);
+        break;
+      case 'manifest':
+        await showTemplateManifest(manifest);
+        break;
+      case 'back':
+        return;
+    }
+  }
+}
+
+async function templatePullFlow(manifest) {
+  const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+  const answers = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'repo',
+      message: chalk.yellow.bold('GitHub repository (owner/name)'),
+      validate: (input) => {
+        const value = input.trim();
+        if (!value) return 'Repository is required';
+        if (!repoPattern.test(value)) return 'Use owner/name syntax (e.g., reposlayer/lili-template)';
+        return true;
+      }
+    },
+    {
+      type: 'input',
+      name: 'ref',
+      message: chalk.yellow.bold('Branch or tag'),
+      default: 'main'
+    },
+    {
+      type: 'input',
+      name: 'subdir',
+      message: chalk.yellow.bold('Subdirectory (blank for repo root)'),
+      default: ''
+    },
+    {
+      type: 'input',
+      name: 'name',
+      message: chalk.yellow.bold('Template identifier'),
+      default: (current) => (current.repo ? current.repo.replace('/', '-').toLowerCase() : ''),
+      validate: (input) => input.trim() ? true : 'Template identifier cannot be empty'
+    },
+    {
+      type: 'input',
+      name: 'title',
+      message: chalk.yellow.bold('Template title (display name)'),
+      default: (current) => {
+        const base = current.name || 'template';
+        return base.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+    },
+    {
+      type: 'input',
+      name: 'description',
+      message: chalk.yellow.bold('Description (optional)'),
+      default: ''
+    }
+  ]);
+
+  const entry = {
+    name: answers.name.trim(),
+    title: answers.title.trim() || answers.name.trim(),
+    description: answers.description.trim() || undefined,
+    source: 'github',
+    repo: answers.repo.trim(),
+    ref: answers.ref.trim() || 'main',
+    subdir: answers.subdir.trim() ? answers.subdir.trim() : null
+  };
+
+  const existing = manifest.templates.find(t => t.name === entry.name);
+  if (existing) {
+    const { overwrite } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'overwrite',
+        message: chalk.yellow(`Template "${entry.name}" already exists. Overwrite configuration?`),
+        default: true
+      }
+    ]);
+    if (!overwrite) {
+      console.log(chalk.gray('\nOperation cancelled. Template left unchanged.\n'));
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      return;
+    }
+  }
+
+  const updatedManifest = {
+    version: manifest.version ?? 1,
+    templates: manifest.templates.filter(t => t.name !== entry.name).concat(entry).sort((a, b) => a.name.localeCompare(b.name))
+  };
+
+  await saveTemplateManifest(updatedManifest);
+
+  try {
+    const cachePath = await runWithLoadingBar(
+      { text: `Pulling ${entry.name} from GitHub`, prefix: 'TPL', color: 'cyan', durationMs: 6000 },
+      () => ensureTemplateCache(entry, { force: true })
+    );
+    console.log();
+    console.log(chalk.green('Template cached successfully!'));
+    console.log(chalk.gray(`Path: ${cachePath}`));
+    if (entry.repo) {
+      console.log(chalk.gray(`Source: ${entry.repo}@${entry.ref}${entry.subdir ? '/' + entry.subdir : ''}`));
+    }
+  } catch (error) {
+    console.log();
+    console.log(chalk.red('Failed to cache template:'), chalk.gray(error.message));
+  }
+
+  console.log();
+  await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to continue') }]);
+}
+
+async function featuredTemplatePull(manifest) {
+  const featured = manifest.templates
+    .filter(t => t.featured)
+    .sort((a, b) => {
+      const aRemote = (a.source || '').toLowerCase() === 'github' ? 0 : 1;
+      const bRemote = (b.source || '').toLowerCase() === 'github' ? 0 : 1;
+      if (aRemote !== bRemote) return aRemote - bRemote;
+      return (a.title || a.name).localeCompare(b.title || b.name);
+    });
+  if (!featured.length) {
+    console.log(chalk.yellow('\nNo featured templates are configured in the manifest yet.\n'));
+    await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
+    return;
+  }
+
+  const choices = featured.map((tpl, idx) => {
+    const label = tpl.title || tpl.name;
+    const description = tpl.description ? chalk.gray(` — ${tpl.description}`) : '';
+    return {
+      name: chalk.white(`[ ${idx + 1} ] `) + chalk.yellow(label) + description,
+      value: tpl.name
+    };
+  });
+
+  const { selection } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'selection',
+      message: chalk.yellow.bold('Pick a template to pull'),
+      choices: [...choices, new inquirer.Separator(), { name: chalk.gray('Cancel'), value: null }],
+      pageSize: Math.min(choices.length + 3, 10)
+    }
+  ]);
+
+  if (!selection) return;
+
+  const template = featured.find(t => t.name === selection);
+  if (!template) return;
+
+  try {
+    const cachePath = await runWithLoadingBar(
+      { text: `Caching ${template.title || template.name}`, prefix: 'TPL', color: 'cyan', durationMs: 5000 },
+      () => ensureTemplateCache(template, { force: true })
+    );
+    console.log();
+    console.log(chalk.green('Template ready.'));
+    console.log(chalk.gray(`Location: ${cachePath}`));
+    console.log(chalk.gray('Use this scaffold by copying it into your workspace.'));
+
+    const { copyNow } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'copyNow',
+        message: chalk.yellow.bold('Copy this template into the current folder now?'),
+        default: true
+      }
+    ]);
+
+    if (copyNow) {
+      const { targetDir } = await inquirer.prompt([
+        {
+          type: 'input',
+          name: 'targetDir',
+          message: chalk.yellow.bold('Destination directory name'),
+          default: template.name,
+          validate: async (input) => {
+            const trimmed = input.trim();
+            if (!trimmed) return 'Destination cannot be empty';
+            const fullPath = path.join(process.cwd(), trimmed);
+            if (await fs.pathExists(fullPath)) return 'Directory already exists in current path';
+            return true;
+          }
+        }
+      ]);
+
+      const destination = path.join(process.cwd(), targetDir.trim());
+      await fs.copy(cachePath, destination, { overwrite: false });
+      await writeTemplateMetadata(destination, { ...template, cachePath });
+      console.log(chalk.green(`Created ${destination}`));
+
+      const packageJsonExists = await fs.pathExists(path.join(destination, 'package.json'));
+      const bootstrapCapable = packageJsonExists || !!template.bootstrap;
+      let bootstrapResult = null;
+
+      if (bootstrapCapable) {
+        const { bootstrapNow } = await inquirer.prompt([
+          {
+            type: 'confirm',
+            name: 'bootstrapNow',
+            message: chalk.yellow.bold('Run automated bootstrap? (install deps, deploy to devnet)'),
+            default: true
+          }
+        ]);
+
+        if (bootstrapNow) {
+          try {
+            bootstrapResult = await bootstrapTemplateDestination(template, destination);
+          } catch (error) {
+            console.log(chalk.red('Bootstrap failed:'), chalk.gray(error.message));
+          }
+        } else {
+          console.log(chalk.gray('Skipped bootstrap. Run setup commands manually when ready.'));
+        }
+      } else {
+        console.log(chalk.gray('No bootstrap actions detected. Project files are ready.'));
+      }
+
+      if (bootstrapResult?.devCommand) {
+        const { startDev } = await inquirer.prompt([
+          {
+            type: 'confirm',
+            name: 'startDev',
+            message: chalk.yellow.bold(`Start development server now? (${bootstrapResult.devCommand})`),
+            default: true
+          }
+        ]);
+
+        if (startDev) {
+          try {
+            await launchDevServer(bootstrapResult.devCommand, {
+              cwd: bootstrapResult.devCwd,
+              env: bootstrapResult.devEnv || undefined
+            });
+            console.log(chalk.green('Development server exited.'));
+          } catch (error) {
+            console.log(chalk.red('Failed to start dev server:'), chalk.gray(error.message));
+          }
+        } else {
+          console.log(chalk.gray(`Start later with: cd ${targetDir.trim()} && ${bootstrapResult.devCommand}`));
+        }
+      } else if (!bootstrapCapable) {
+        console.log(chalk.gray(`Next steps: cd ${targetDir.trim()} and follow project README instructions.`));
+      } else if (!bootstrapResult) {
+        console.log(chalk.gray(`Manual dev server hint: cd ${targetDir.trim()} && npm run dev`));
+      } else {
+        console.log(chalk.gray('Bootstrap finished. Start project commands when you are ready.'));
+      }
+    }
+  } catch (error) {
+    console.log();
+    console.log(chalk.red('Failed to pull template:'), chalk.gray(error.message));
+  }
+
+  console.log();
+  await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to continue') }]);
+}
+
+async function showCachedTemplatesView(cached) {
+  const templates = cached ?? await listCachedTemplates();
+
+  displayTitle();
+  console.log(chalk.bgHex('#8B5CF6').black.bold(' CACHED TEMPLATES '));
+  console.log();
+
+  if (!templates.length) {
+    console.log(chalk.yellow('No templates cached yet. Run "Pull Template" to add one.'));
+  } else {
+    templates.forEach((tpl, idx) => {
+      const meta = tpl.meta || {};
+      const header = chalk.white.bold(`${String(idx + 1).padStart(2, '0')}. ${meta.title || tpl.name}`);
+      console.log(header);
+      console.log(chalk.gray(`    Identifier : ${tpl.name}`));
+      console.log(chalk.gray(`    Path       : ${tpl.path}`));
+      if (meta.repo) {
+        console.log(chalk.gray(`    Source     : ${meta.repo}${meta.ref ? '@' + meta.ref : ''}`));
+      } else {
+        console.log(chalk.gray('    Source     : local package template'));
+      }
+      if (meta.updatedAt) {
+        console.log(chalk.gray(`    Updated    : ${meta.updatedAt}`));
+      }
+      if (meta.description) {
+        console.log(chalk.gray(`    Notes      : ${meta.description}`));
+      }
+      console.log();
+    });
+  }
+
+  await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
+}
+
+async function showTemplateManifest(manifest) {
+  displayTitle();
+  console.log(chalk.bgHex('#8B5CF6').black.bold(' TEMPLATE MANIFEST '));
+  console.log();
+
+  if (!manifest.templates.length) {
+    console.log(chalk.yellow('Manifest is empty. Add entries with "Pull Template".'));
+  } else {
+    manifest.templates.forEach((tpl, idx) => {
+      console.log(chalk.white.bold(`${String(idx + 1).padStart(2, '0')}. ${tpl.title || tpl.name}`));
+      console.log(chalk.gray(`    Identifier : ${tpl.name}`));
+      console.log(chalk.gray(`    Source     : ${tpl.source || 'github'}`));
+      if (tpl.repo) {
+        console.log(chalk.gray(`    Repo       : ${tpl.repo}${tpl.ref ? '@' + tpl.ref : ''}`));
+      }
+      if (tpl.subdir) {
+        console.log(chalk.gray(`    Subdir     : ${tpl.subdir}`));
+      }
+      if (tpl.description) {
+        console.log(chalk.gray(`    Notes      : ${tpl.description}`));
+      }
+      console.log();
+    });
+  }
+
+  await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
+}
+
+async function runDoctor() {
+  await initConfig();
+  displayTitle();
+
+  const isWindows = process.platform === 'win32';
+  const solanaInstallCmd = isWindows
+    ? 'iwr -useb https://release.solana.com/stable/install.ps1 | iex'
+    : 'curl -sSfL https://release.solana.com/stable/install | sh -s -- -y';
+  const rustInstallCmd = isWindows
+    ? 'iwr https://win.rustup.rs -UseBasicParsing | Invoke-Expression'
+    : 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y';
+
+  const checks = [
+    {
+      key: 'node',
+      label: 'Node.js Runtime',
+      description: 'Requires Node.js 18 or newer',
+      autoFix: false,
+      manualFix: 'Upgrade Node.js to version 18+. Visit https://nodejs.org/en/download',
+      test: async () => {
+        const version = process.version;
+        const major = Number(version.replace('v', '').split('.')[0] || '0');
+        return { ok: major >= 18, detail: version };
+      }
+    },
+    {
+      key: 'git',
+      label: 'Git',
+      description: 'Required for pulling templates from GitHub',
+      autoFix: false,
+      manualFix: 'Install Git from https://git-scm.com/downloads',
+      test: async () => {
+        try {
+          const { stdout } = await execAsync('git --version');
+          return { ok: true, detail: stdout.trim() };
+        } catch {
+          return { ok: false, detail: 'Git not detected in PATH' };
+        }
+      }
+    },
+    {
+      key: 'solana',
+      label: 'Solana CLI',
+      description: 'Provides solana, solana-keygen, cargo-build-sbf',
+      fix: async () => runShellCommand(solanaInstallCmd),
+      manualFix: isWindows
+        ? 'Run the Solana PowerShell installer from https://release.solana.com'
+        : 'Run: curl -sSfL https://release.solana.com/stable/install | sh -s -- -y',
+      test: async () => {
+        try {
+          const { stdout } = await execAsync('solana --version');
+          return { ok: true, detail: stdout.trim() };
+        } catch {
+          return { ok: false, detail: 'Solana CLI not detected' };
+        }
+      }
+    },
+    {
+      key: 'rust',
+      label: 'Rust Toolchain',
+      description: 'Rust compiler and cargo for building programs',
+      fix: async () => runShellCommand(rustInstallCmd),
+      manualFix: isWindows
+        ? 'Install Rust using rustup-init.exe from https://win.rustup.rs'
+        : 'Run: curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y',
+      test: async () => {
+        try {
+          const { stdout } = await execAsync('rustc --version');
+          return { ok: true, detail: stdout.trim() };
+        } catch {
+          return { ok: false, detail: 'Rust compiler not detected' };
+        }
+      }
+    },
+    {
+      key: 'cargo-build-sbf',
+      label: 'cargo-build-sbf',
+      description: 'Builds Solana programs via cargo-build-sbf',
+      fix: async () => runShellCommand('solana-install init'),
+      manualFix: 'Once Solana CLI is installed run: solana-install init',
+      test: async () => {
+        try {
+          const locator = isWindows ? 'where cargo-build-sbf' : 'which cargo-build-sbf';
+          await execAsync(locator);
+          return { ok: true, detail: 'cargo-build-sbf available' };
+        } catch {
+          return { ok: false, detail: 'cargo-build-sbf not in PATH' };
+        }
+      }
+    }
+  ];
+
+  console.log(chalk.bgHex('#8B5CF6').black.bold(' LILI DOCTOR '));
+  console.log();
+
+  const results = [];
+  const remediation = [];
+
+  for (const check of checks) {
+    let evaluation;
+    try {
+      evaluation = await runWithLoadingBar(
+        { text: `Checking ${check.label}`, prefix: 'DOC', color: 'cyan', durationMs: 2000 },
+        () => check.test()
+      );
+    } catch (error) {
+      evaluation = { ok: false, detail: error.message };
+    }
+
+    let status = evaluation.ok ? 'ok' : 'fail';
+    let detail = evaluation.detail || '';
+
+    const canAutoFix = (check.autoFix ?? true) && typeof check.fix === 'function' && !evaluation.ok;
+
+    if (canAutoFix) {
+      try {
+        await runWithLoadingBar(
+          { text: `Fixing ${check.label}`, prefix: 'FIX', color: 'green', durationMs: 8000 },
+          () => check.fix()
+        );
+        const verification = await check.test();
+        status = verification.ok ? 'fixed' : 'fail';
+        detail = verification.detail || detail;
+      } catch (error) {
+        status = 'error';
+        detail = error.message;
+        if (check.manualFix) {
+          remediation.push(check.manualFix);
+        }
+      }
+    } else if (!evaluation.ok) {
+      status = 'warn';
+      if (check.manualFix) {
+        remediation.push(check.manualFix);
+      }
+    }
+
+    results.push({
+      key: check.key,
+      label: check.label,
+      status,
+      detail
+    });
+  }
+
+  console.log();
+  console.log(chalk.bgHex('#8B5CF6').black.bold(' DIAGNOSTIC SUMMARY '));
+  console.log();
+
+  const statusLabelMap = {
+    ok: { text: 'OK', color: chalk.green, icon: '✔' },
+    fixed: { text: 'FIXED', color: chalk.hex('#22c55e'), icon: '🛠' },
+    warn: { text: 'WARN', color: chalk.yellow, icon: '⚠' },
+    fail: { text: 'FAIL', color: chalk.red, icon: '✖' },
+    error: { text: 'ERROR', color: chalk.redBright, icon: '✖' }
+  };
+
+  results.forEach((item) => {
+    const meta = statusLabelMap[item.status] || statusLabelMap.warn;
+    const colorFn = meta.color;
+    const label = colorFn(meta.text.padEnd(7));
+    console.log(
+      `${meta.icon} ` +
+      chalk.white(item.label.padEnd(22)) +
+      label +
+      chalk.gray(' -> ') +
+      chalk.gray(item.detail || 'No additional info')
+    );
+  });
+
+  const overallPass = results.every(item => item.status === 'ok' || item.status === 'fixed');
+  console.log();
+  console.log(overallPass
+    ? chalk.green('Environment looks healthy!')
+    : chalk.yellow('Further attention required. See recommended actions below.'));
+
+  if (remediation.length) {
+    console.log();
+    console.log(chalk.hex('#8B5CF6').bold('Recommended next steps:'));
+    remediation.forEach((step, idx) => {
+      console.log(chalk.gray(`${idx + 1}. ${step}`));
+    });
+  }
+
+  await recordDoctorEvent({
+    results,
+    overallPass,
+    platform: process.platform,
+    node: process.version
+  });
+
+  const history = await loadDoctorHistory();
+  if (history.length > 1) {
+    const previous = history[1];
+    console.log();
+    console.log(chalk.gray(`Previous run: ${previous.timestamp}`));
+  }
+
+  console.log();
+  await inquirer.prompt([{ type: 'input', name: 'continue', message: chalk.gray('Press Enter to return') }]);
 }
 
 /**
